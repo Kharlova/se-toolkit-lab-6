@@ -14,8 +14,8 @@ from pathlib import Path
 
 def test_agent_returns_valid_json():
     """Test that agent.py returns valid JSON with answer and tool_calls fields."""
-    # Get the project root directory (parent of tests/)
-    project_root = Path(__file__).parent.parent
+    # Get the project root directory
+    project_root = Path(__file__).parent.parent.parent
     agent_path = project_root / "agent.py"
 
     # Run agent.py with a test question
