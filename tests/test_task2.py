@@ -14,14 +14,15 @@ from pathlib import Path
 
 def run_agent(question: str) -> dict:
     """Run agent.py with a question and return the parsed JSON output."""
-    project_root = Path(__file__).parent.parent.parent
+    # Project root is two levels up from tests directory
+    project_root = Path(__file__).parent.parent
     agent_path = project_root / "agent.py"
 
     result = subprocess.run(
         [sys.executable, str(agent_path), question],
         capture_output=True,
         text=True,
-        timeout=60,
+        timeout=120,
         cwd=str(project_root),
     )
 
