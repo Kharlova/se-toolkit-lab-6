@@ -40,6 +40,7 @@ def test_agent_returns_valid_json():
     # Verify required fields exist
     assert "answer" in data, "Missing 'answer' field in output"
     assert "tool_calls" in data, "Missing 'tool_calls' field in output"
+    assert "source" in data, "Missing 'source' field in output"
 
     # Verify answer is non-empty string
     assert isinstance(data["answer"], str), "'answer' should be a string"
