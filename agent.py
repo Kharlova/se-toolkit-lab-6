@@ -41,15 +41,24 @@ def load_env_file(env_path: Path) -> dict[str, str]:
 
 
 def load_config() -> dict[str, str]:
-    """Load LLM configuration from .env.agent.secret."""
-    env_path = PROJECT_ROOT / ".env.agent.secret"
+    """Load LLM and API configuration from environment files."""
+    agent_env_path = PROJECT_ROOT / ".env.agent.secret"
+    docker_env_path = PROJECT_ROOT / ".env.docker.secret"
 
-    env_vars = load_env_file(env_path)
+    agent_env_vars = load_env_file(agent_env_path)
+    docker_env_vars = load_env_file(docker_env_path)
 
     config = {
-        "api_key": env_vars.get("LLM_API_KEY", ""),
-        "api_base": env_vars.get("LLM_API_BASE", ""),
-        "model": env_vars.get("LLM_MODEL", "qwen3-coder-plus"),
+        # LLM configuration
+        "api_key": agent_env_vars.get("LLM_API_KEY", ""),
+        "api_base": agent_env_vars.get("LLM_API_BASE", ""),
+        "model": agent_env_vars.get("LLM_MODEL", "qwen3-coder-plus"),
+        # Backend API configuration
+        "lms_api_key": docker_env_vars.get("LMS_API_KEY", ""),
+        "agent_api_base_url": os.environ.get(
+            "AGENT_API_BASE_URL",
+            agent_env_vars.get("AGENT_API_BASE_URL", "http://localhost:42001")
+        ),
     }
 
     return config
@@ -62,7 +71,7 @@ def get_tool_schemas() -> list[dict]:
             "type": "function",
             "function": {
                 "name": "read_file",
-                "description": "Read the contents of a file from the project repository",
+                "description": "Read the contents of a file from the project repository. Use for wiki documentation and source code questions.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -79,7 +88,7 @@ def get_tool_schemas() -> list[dict]:
             "type": "function",
             "function": {
                 "name": "list_files",
-                "description": "List files and directories at a given path",
+                "description": "List files and directories at a given path. Use to discover files in a directory.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -89,6 +98,35 @@ def get_tool_schemas() -> list[dict]:
                         }
                     },
                     "required": ["path"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "query_api",
+                "description": "Query the backend API. Use for data-dependent questions like item counts, scores, analytics, or to check API status codes. Returns JSON with status_code and body. Set auth=false to test unauthenticated requests.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "method": {
+                            "type": "string",
+                            "description": "HTTP method (GET, POST, PUT, DELETE, etc.)"
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": "API path (e.g., '/items/', '/analytics/completion-rate?lab=lab-01')"
+                        },
+                        "body": {
+                            "type": "string",
+                            "description": "Optional JSON request body for POST/PUT requests"
+                        },
+                        "auth": {
+                            "type": "boolean",
+                            "description": "Whether to include authentication (default: true). Set to false to test unauthenticated requests."
+                        }
+                    },
+                    "required": ["method", "path"]
                 }
             }
         }
@@ -172,6 +210,82 @@ def list_files(path: str) -> str:
         return f"Error listing directory: {e}"
 
 
+def query_api(method: str, path: str, body: str | None = None, auth: bool = True) -> str:
+    """
+    Query the backend API with optional authentication.
+
+    Args:
+        method: HTTP method (GET, POST, PUT, DELETE, etc.)
+        path: API path (e.g., '/items/', '/analytics/completion-rate?lab=lab-01')
+        body: Optional JSON request body for POST/PUT requests
+        auth: Whether to include authentication (default: True)
+
+    Returns:
+        JSON string with status_code and body, or error message
+    """
+    config = load_config()
+    lms_api_key = config.get("lms_api_key", "")
+    base_url = config.get("agent_api_base_url", "http://localhost:42002")
+
+    # Build full URL
+    url = f"{base_url.rstrip('/')}{path}"
+
+    headers = {
+        "Content-Type": "application/json",
+    }
+    
+    # Only add authentication if requested
+    if auth:
+        if not lms_api_key:
+            return '{"status_code": 500, "body": {"error": "LMS_API_KEY not configured"}}'
+        headers["Authorization"] = f"Bearer {lms_api_key}"
+
+    try:
+        # Use sync httpx for simplicity in tool execution
+        with httpx.Client(timeout=30.0) as client:
+            if method.upper() == "GET":
+                response = client.get(url, headers=headers)
+            elif method.upper() == "POST":
+                response = client.post(url, headers=headers, json=json.loads(body) if body else None)
+            elif method.upper() == "PUT":
+                response = client.put(url, headers=headers, json=json.loads(body) if body else None)
+            elif method.upper() == "DELETE":
+                response = client.delete(url, headers=headers)
+            else:
+                return f'{{"status_code": 400, "body": {{"error": "Unsupported method: {method}"}}}}'
+
+            # Try to parse response as JSON
+            try:
+                response_body = response.json()
+            except json.JSONDecodeError:
+                response_body = response.text
+
+            return json.dumps({
+                "status_code": response.status_code,
+                "body": response_body
+            })
+    except httpx.HTTPStatusError as e:
+        return json.dumps({
+            "status_code": e.response.status_code,
+            "body": {"error": str(e)}
+        })
+    except httpx.RequestError as e:
+        return json.dumps({
+            "status_code": 0,
+            "body": {"error": f"Request error: {e}"}
+        })
+    except json.JSONDecodeError as e:
+        return json.dumps({
+            "status_code": 400,
+            "body": {"error": f"Invalid JSON body: {e}"}
+        })
+    except Exception as e:
+        return json.dumps({
+            "status_code": 500,
+            "body": {"error": str(e)}
+        })
+
+
 def execute_tool(tool_name: str, args: dict) -> str:
     """
     Execute a tool and return the result.
@@ -187,23 +301,34 @@ def execute_tool(tool_name: str, args: dict) -> str:
         return read_file(args.get("path", ""))
     elif tool_name == "list_files":
         return list_files(args.get("path", ""))
+    elif tool_name == "query_api":
+        return query_api(
+            args.get("method", "GET"),
+            args.get("path", ""),
+            args.get("body"),
+            args.get("auth", True)
+        )
     else:
         return f"Error: Unknown tool '{tool_name}'"
 
 
-SYSTEM_PROMPT = """You are a documentation agent that answers questions by reading the project wiki.
+SYSTEM_PROMPT = """You are a documentation and system agent that answers questions by reading the project wiki, source code, and querying the backend API.
 
-You have access to two tools:
-- `list_files`: List files and directories at a given path
-- `read_file`: Read the contents of a file
+You have access to three tools:
+- `list_files`: List files and directories at a given path. Use to discover files in a directory.
+- `read_file`: Read the contents of a file. Use for wiki documentation and source code questions.
+- `query_api`: Query the backend API. Use for data-dependent questions (item counts, scores, analytics) or to check API responses (status codes, error messages). Set auth=false to test unauthenticated requests.
 
 To answer a question:
-1. Use `list_files` to discover wiki files if you're unsure where to look
-2. Use `read_file` to read specific files and find the answer
-3. Always include a source reference in your answer (file path + section anchor like `wiki/git-workflow.md#resolving-merge-conflicts`)
-4. Make at most 10 tool calls
+1. For wiki/documentation questions: Use `list_files` to discover wiki files, then `read_file` to read specific files. Wiki files are in the `wiki/` directory.
+2. For source code questions: Backend source code is in `backend/app/` directory. Routers are in `backend/app/routers/`. Use `list_files` to discover files, then `read_file` to read them.
+3. For data-dependent questions (e.g., "how many items", "what is the score"): Use `query_api` to query the backend.
+4. For API behavior questions (e.g., status codes, errors): Use `query_api` to make the actual request.
+5. For bug diagnosis questions: First query the API to see the error, then read the source code to find the bug location. Always include the source file path in your answer.
+6. Always include a source reference in your answer when reading files (file path + section anchor like `wiki/git-workflow.md#resolving-merge-conflicts`). For API queries about bugs, also mention the source file where the bug is located.
+7. Make at most 10 tool calls.
 
-When you have found the answer, respond with a clear, concise answer and include the source reference.
+When you have found the answer, respond with a clear, concise answer. Include the source reference for file-based answers.
 """
 
 
@@ -233,6 +358,7 @@ async def call_llm(
     payload = {
         "model": config["model"],
         "messages": messages,
+        "max_tokens": 2048,
     }
 
     if tools:
@@ -297,6 +423,14 @@ async def run_agent(config: dict[str, str], question: str) -> dict:
         # Execute tool calls
         print(f"LLM requested {len(tool_calls)} tool call(s)", file=sys.stderr)
 
+        # First, append the assistant's message with tool_calls
+        assistant_message = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": tool_calls
+        }
+        messages.append(assistant_message)
+
         for tool_call in tool_calls:
             tool_call_count += 1
             if tool_call_count > MAX_TOOL_CALLS:
@@ -322,7 +456,6 @@ async def run_agent(config: dict[str, str], question: str) -> dict:
             messages.append({
                 "role": "tool",
                 "tool_call_id": tool_call.get("id", f"{tool_name}_{tool_call_count}"),
-                "name": tool_name,
                 "content": result
             })
 
@@ -349,7 +482,7 @@ async def run_agent(config: dict[str, str], question: str) -> dict:
 def extract_source(answer: str) -> str:
     """
     Try to extract a source reference from the answer.
-    Looks for patterns like wiki/file.md or wiki/file.md#section
+    Looks for patterns like wiki/file.md, backend/app/*.py, or file paths.
 
     Args:
         answer: The LLM's answer text
@@ -365,6 +498,22 @@ def extract_source(answer: str) -> str:
 
     if match:
         return match.group(1)
+
+    # Look for backend source file references
+    pattern = r'(backend/app/[\w\-\.\/]+\.(?:py|md))'
+    match = re.search(pattern, answer)
+
+    if match:
+        return match.group(1)
+
+    # Look for /app/backend/... paths (from error messages)
+    pattern = r'(/app/backend/[\w\-\.\/]+)'
+    match = re.search(pattern, answer)
+
+    if match:
+        # Convert to relative path
+        path = match.group(1).replace('/app/backend/', 'backend/')
+        return path
 
     return ""
 
